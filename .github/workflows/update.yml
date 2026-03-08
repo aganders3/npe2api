@@ -18,6 +18,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: deploy-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (github.event_name == 'workflow_dispatch' && inputs.preview_name || 'production') }}
+  cancel-in-progress: false
+
 jobs:
   deploy:
     name: Update and Deploy to Cloudflare

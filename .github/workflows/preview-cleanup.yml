@@ -5,6 +5,16 @@ on:
     types: [closed, unlabeled]
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      preview_name:
+        description: 'Preview name to cleanup (e.g., pr-123, test-feature)'
+        required: true
+        type: string
+
+concurrency:
+  group: deploy-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || inputs.preview_name }}
+  cancel-in-progress: true
 
 jobs:
   cleanup:
@@ -18,6 +28,28 @@ jobs:
       deployments: 'write'
 
     steps:
+      - name: Validate preview environment
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            PREVIEW_NAME="pr-${{ github.event.pull_request.number }}"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            PREVIEW_NAME="${{ inputs.preview_name }}"
+          else
+            echo "ERROR: Cleanup workflow should only run for pull_request or workflow_dispatch events!"
+            echo "Event: ${{ github.event_name }}"
+            exit 1
+          fi
+
+          # Safety check: don't allow cleaning up production
+          if [ "$PREVIEW_NAME" == "npe2api" ] || [ -z "$PREVIEW_NAME" ]; then
+            echo "ERROR: Cannot clean up production deployment!"
+            echo "Preview name: $PREVIEW_NAME"
+            exit 1
+          fi
+
+          echo "✓ Validated: cleaning up preview '$PREVIEW_NAME'"
+          echo "PREVIEW_NAME=$PREVIEW_NAME" >> $GITHUB_ENV
+
       - uses: actions/checkout@v6
 
       # pywrangler requires uv
@@ -31,7 +63,7 @@ jobs:
 
       - name: Cleanup preview resources
         run: |
-          python -m npe2api.preview_cleanup pr-${{ github.event.pull_request.number }}
+          python -m npe2api.preview_cleanup $PREVIEW_NAME
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -40,7 +72,7 @@ jobs:
 
       - name: Mark deployments as inactive
         run: |
-          ENVIRONMENT="preview/pr-${{ github.event.pull_request.number }}"
+          ENVIRONMENT="preview/$PREVIEW_NAME"
 
           # Get all deployments for this environment
           DEPLOYMENTS=$(gh api "/repos/${{ github.repository }}/deployments?environment=$ENVIRONMENT&per_page=100" --jq '.[].id')
@@ -53,3 +85,5 @@ jobs:
               -f state='inactive' \
               -f description='Preview environment cleaned up' || true
           done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
