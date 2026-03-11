@@ -20,10 +20,11 @@ jobs:
   cleanup:
     name: Cleanup Preview Deployment
     runs-on: ubuntu-latest
-    # Cleanup when PR is closed with 'preview' label, or when 'preview' label is removed
+    # Cleanup when PR is closed with 'preview' label, when 'preview' label is removed, or manually dispatched
     if: |
       (github.event_name == 'pull_request' && github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'preview')) ||
-      (github.event_name == 'pull_request' && github.event.action == 'unlabeled' && github.event.label.name == 'preview')
+      (github.event_name == 'pull_request' && github.event.action == 'unlabeled' && github.event.label.name == 'preview') ||
+      (github.event_name == 'workflow_dispatch' && inputs.preview_name != '')
     permissions:
       deployments: 'write'
 
