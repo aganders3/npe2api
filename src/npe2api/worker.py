@@ -69,6 +69,12 @@ class Default(WorkerEntrypoint):
 
         if response is None:
             log_info("Cache miss, fetching and caching request", url=request.url)
+
+            # Monkey-patch workers to add wait_until alias for waitUntil
+            # see https://github.com/cloudflare/workers-py/issues/70
+            import workers
+            workers.wait_until = workers.waitUntil
+
             # If not in cache, pass through to the FastAPI app
             import asgi
 
