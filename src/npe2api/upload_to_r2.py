@@ -3,20 +3,23 @@
 Upload generated JSON files to R2 bucket.
 
 Reads all JSON files from public/ directory and uploads them to R2.
-Uses R2_BUCKET_NAME environment variable to support both production and preview buckets.
 
-For local development, create a .env file with:
+For remote R2, create a .env file with:
     CLOUDFLARE_ACCOUNT_ID=your_account_id
     R2_ACCESS_KEY_ID=your_access_key
     R2_SECRET_ACCESS_KEY=your_secret_key
-    R2_BUCKET_NAME=npe2api
 
 Usage:
-    uv run -m npe2api.upload_to_r2
+    uv run -m npe2api.upload_to_r2 npe2api           # Upload to remote R2 bucket "npe2api"
+    uv run -m npe2api.upload_to_r2 npe2api --local   # Upload to local R2 for pywrangler dev --local
 """
 
+import argparse
 import hashlib
+import json
 import os
+import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -40,76 +43,154 @@ def calculate_md5(file_path: Path) -> str:
     return md5.hexdigest()
 
 
-def needs_upload(s3, bucket_name: str, key: str, file_path: Path) -> bool:
-    """Check if file needs to be uploaded by comparing MD5 with R2 ETag."""
-    try:
-        response = s3.head_object(Bucket=bucket_name, Key=key)
-        # R2 ETag is the MD5 hash wrapped in quotes
-        remote_etag = response["ETag"].strip('"')
-        local_md5 = calculate_md5(file_path)
-        return remote_etag != local_md5
-    except s3.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "404":
-            return True  # File doesn't exist, needs upload
-        raise
-
-
-def upload_file(s3, bucket_name: str, file_path: Path, public_dir: Path) -> tuple[str, bool]:
-    """Upload a single file to R2 if it has changed."""
-    key = str(file_path.relative_to(public_dir))
-
-    # Check if upload is needed
-    if not needs_upload(s3, bucket_name, key, file_path):
-        return key, False  # Skipped
-
-    # Determine content type
-    content_type = "application/json"
+def get_content_type(key: str) -> str:
+    """Determine content type based on file extension."""
     if key.endswith(".html"):
-        content_type = "text/html"
+        return "text/html"
     elif key.endswith(".json"):
-        content_type = "application/json"
-
-    s3.upload_file(
-        str(file_path),
-        bucket_name,
-        key,
-        ExtraArgs={
-            "ContentType": content_type,
-            "CacheControl": "public, max-age=3600",
-        },
-    )
-    return key, True  # Uploaded
+        return "application/json"
+    return "application/octet-stream"
 
 
-def upload_to_r2():
+class R2Remote:
+    """Remote R2 backend using boto3."""
+
+    def __init__(self, bucket_name: str):
+        self.bucket_name = bucket_name
+        account_id = os.environ["CLOUDFLARE_ACCOUNT_ID"]
+        access_key_id = os.environ["R2_ACCESS_KEY_ID"]
+        secret_access_key = os.environ["R2_SECRET_ACCESS_KEY"]
+
+        session = boto3.Session(
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+        )
+
+        self.s3 = session.client(
+            "s3",
+            endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+        )
+
+    def create(self):
+        """Create bucket (ignore if it already exists)."""
+        try:
+            self.s3.create_bucket(Bucket=self.bucket_name)
+            print(f"✓ Created bucket: {self.bucket_name}")
+        except self.s3.exceptions.ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code")
+            if error_code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                print(f"Using bucket: {self.bucket_name}")
+            else:
+                raise
+
+    def put(self, file_path: Path, key: str) -> bool:
+        """Upload file if it has changed (compares MD5 with ETag). Returns True if uploaded."""
+        # Check if upload is needed
+        try:
+            response = self.s3.head_object(Bucket=self.bucket_name, Key=key)
+            remote_etag = response["ETag"].strip('"')
+            local_md5 = calculate_md5(file_path)
+            if remote_etag == local_md5:
+                return False  # File unchanged
+        except self.s3.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] != "404":
+                raise
+
+        # Upload file
+        self.s3.upload_file(
+            str(file_path),
+            self.bucket_name,
+            key,
+            ExtraArgs={
+                "ContentType": get_content_type(key),
+                "CacheControl": "public, max-age=3600",
+            },
+        )
+        return True
+
+    def list(self) -> set[str]:
+        """List all JSON keys in the bucket."""
+        keys = set()
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket_name):
+            if "Contents" in page:
+                for obj in page["Contents"]:
+                    key = obj["Key"]
+                    if key.endswith(".json"):
+                        keys.add(key)
+        return keys
+
+    def delete(self, key: str):
+        """Delete an object from the bucket."""
+        self.s3.delete_object(Bucket=self.bucket_name, Key=key)
+
+
+class R2Local:
+    """Local R2 backend using pywrangler CLI."""
+
+    def __init__(self, bucket_name: str):
+        self.bucket_name = bucket_name
+
+    def create(self):
+        """Local buckets are created automatically by wrangler."""
+        print(f"Using local bucket: {self.bucket_name}")
+
+    def put(self, file_path: Path, key: str, retries: int = 3) -> bool:
+        """Upload file using pywrangler with retry logic. Returns True if uploaded."""
+        cmd = [
+            "pywrangler", "r2", "object", "put",
+            f"{self.bucket_name}/{key}",
+            "--file", str(file_path),
+            "--local",
+            "--content-type", get_content_type(key),
+            "--cache-control", "public, max-age=3600",
+        ]
+
+        for attempt in range(retries):
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                return True
+            except subprocess.CalledProcessError as e:
+                if attempt == retries - 1:
+                    # Final attempt failed
+                    print(f"✗ Failed to upload {key} after {retries} attempts: {e.stderr}")
+                    return False
+                # Retry with exponential backoff
+                time.sleep(0.1 * (2 ** attempt))
+
+        return False
+
+    def list(self) -> set[str]:
+        """List all JSON keys in the local bucket."""
+        cmd = ["pywrangler", "r2", "object", "list", self.bucket_name, "--local"]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            data = json.loads(result.stdout)
+            return {obj["key"] for obj in data if obj["key"].endswith(".json")}
+        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError):
+            return set()
+
+    def delete(self, key: str, retries: int = 3):
+        """Delete an object from the local bucket with retry logic."""
+        cmd = ["pywrangler", "r2", "object", "delete", f"{self.bucket_name}/{key}", "--local"]
+
+        for attempt in range(retries):
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                return
+            except subprocess.CalledProcessError as e:
+                if attempt == retries - 1:
+                    print(f"✗ Failed to delete {key} after {retries} attempts: {e.stderr}")
+                    return
+                time.sleep(0.1 * (2 ** attempt))
+
+
+def upload_to_r2(bucket_name: str, use_local: bool = False):
     """Sync all JSON files from public/ directory to R2, removing stale files."""
-    account_id = os.environ["CLOUDFLARE_ACCOUNT_ID"]
-    access_key_id = os.environ["R2_ACCESS_KEY_ID"]
-    secret_access_key = os.environ["R2_SECRET_ACCESS_KEY"]
-    bucket_name = os.environ.get("R2_BUCKET_NAME", "npe2api")
-
-    session = boto3.Session(
-        aws_access_key_id=access_key_id,
-        aws_secret_access_key=secret_access_key,
-    )
-
-    s3 = session.client(
-        "s3",
-        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
-    )
-
-    # Create bucket if it doesn't exist
-    try:
-        s3.head_bucket(Bucket=bucket_name)
-        print(f"Using bucket: {bucket_name}")
-    except s3.exceptions.ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code")
-        if error_code == "404":
-            print(f"Bucket '{bucket_name}' not found, creating...")
-            s3.create_bucket(Bucket=bucket_name)
-            print(f"✓ Created bucket: {bucket_name}")
-        else:
-            raise
+    # Create R2 client
+    r2 = R2Local(bucket_name) if use_local else R2Remote(bucket_name)
+    r2.create()
 
     # Upload all files from public/ directory
     public_dir = Path("public")
@@ -126,11 +207,14 @@ def upload_to_r2():
     skipped_count = 0
 
     # Upload files in parallel
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {
-            executor.submit(upload_file, s3, bucket_name, file_path, public_dir): file_path
-            for file_path in files_to_process
-        }
+    def upload_one(file_path):
+        key = str(file_path.relative_to(public_dir))
+        was_uploaded = r2.put(file_path, key)
+        return key, was_uploaded
+
+    max_workers = 50 if use_local else 10
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(upload_one, f): f for f in files_to_process}
 
         for future in as_completed(futures):
             key, was_uploaded = future.result()
@@ -143,23 +227,14 @@ def upload_to_r2():
 
     # Delete files from R2 that no longer exist locally
     print("\nChecking for stale files in R2...")
-    remote_keys = set()
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket_name):
-        if "Contents" in page:
-            for obj in page["Contents"]:
-                key = obj["Key"]
-                # Only track JSON files (to avoid deleting non-managed files)
-                if key.endswith(".json"):
-                    remote_keys.add(key)
-
+    remote_keys = r2.list()
     stale_keys = remote_keys - local_keys
     deleted_count = 0
 
     if stale_keys:
         print(f"Found {len(stale_keys)} stale files to delete...")
         for key in stale_keys:
-            s3.delete_object(Bucket=bucket_name, Key=key)
+            r2.delete(key)
             print(f"✗ Deleted: {key}")
             deleted_count += 1
     else:
@@ -168,7 +243,28 @@ def upload_to_r2():
     print("")
     print(f"Uploaded {uploaded_count} files, skipped {skipped_count} (unchanged), deleted {deleted_count} (stale)")
     print(f"  Bucket: {bucket_name}")
+    if use_local:
+        print("")
+        print("You can now run: pywrangler dev --local")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sync JSON files from public/ directory to R2 bucket"
+    )
+    parser.add_argument(
+        "bucket_name",
+        help="Name of the R2 bucket (e.g., npe2api or npe2api-pr-123)",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Upload to local R2 bucket (.wrangler/state) for pywrangler dev --local",
+    )
+
+    args = parser.parse_args()
+    upload_to_r2(args.bucket_name, use_local=args.local)
 
 
 if __name__ == "__main__":
-    upload_to_r2()
+    main()
