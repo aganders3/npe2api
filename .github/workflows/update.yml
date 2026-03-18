@@ -124,12 +124,11 @@ jobs:
 
       - name: Upload to R2
         run: |
-          python -m npe2api.upload_to_r2
+          python -m npe2api.upload_to_r2 ${{ steps.deploy-config.outputs.bucket_name }}
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ steps.deploy-config.outputs.bucket_name }}
 
       # Push public/ directory to separate data repository for history tracking
       # Uses shallow clone to fetch only latest commit, keeping operation fast
