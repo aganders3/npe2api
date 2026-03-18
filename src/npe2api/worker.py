@@ -1,9 +1,9 @@
 """
-Cloudflare Worker for npe2api - FastAPI server and CloudFlare Workers entrypoint.
+Cloudflare Worker for npe2api - FastAPI server and CloudFlare entrypoint.
 
-This module serves as the entrypoint for remote deployment on Cloudflare Workers.
-It implements a FastAPI application that handles API requests and serves data from
-R2 object storage.
+This module serves as the entrypoint for remote deployment on Cloudflare.
+It implements a FastAPI application that handles API requests and serves
+data from R2 object storage.
 
 Key Features:
 - FastAPI server with Pyodide/Workers integration
@@ -56,6 +56,14 @@ def log_error(msg: str, **kwargs):
     print(json.dumps({"message": msg, **kwargs}), file=sys.stderr, flush=True)
 
 
+# cache for 1h (data updates every 2h)
+CACHE_TTL = 3600
+
+
+# this is the Cloudflare Workers entrypoint
+# here is where we pass the HTTP request on to FastAPI
+# see https://github.com/cloudflare/python-workers-examples
+# we also do some caching at this layer, so some requests can skip FastAPI/R2
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
         cache_url = request.url
@@ -63,27 +71,19 @@ class Default(WorkerEntrypoint):
         cache_key = Request.new(cache_url)
         cache = caches.default
 
-        # Check whether the value is already available in the cache
-        # if not, you will need to fetch it from origin, and store it in the cache
         response = await cache.match(cache_key)
 
         if response is None:
-            log_info("Cache miss, fetching and caching request", url=request.url)
-
-            # Monkey-patch workers to add wait_until alias for waitUntil
-            # see https://github.com/cloudflare/workers-py/issues/70
-            import workers
-            workers.wait_until = workers.waitUntil
-
-            # If not in cache, pass through to the FastAPI app
+            # if not in cache, pass through to the FastAPI app via asgi adapter
             import asgi
 
+            log_info("Cache miss, passing request to FastAPI", url=request.url)
             response = await asgi.fetch(app, request.js_object, self.env)
 
-            # Store in cache (expiry controlled by Cache-Control headers from FastAPI)
-            self.ctx.waitUntil(create_proxy(cache.put(cache_key, response.clone())))
-        else:
-            log_info("Cache hit", url=request.url)
+            # store in cache (expiry Cache-Control headers in FastAPI Response)
+            self.ctx.waitUntil(
+                create_proxy(cache.put(cache_key, response.clone()))
+            )
 
         return response
 
@@ -121,16 +121,7 @@ async def get_from_r2(request: FastAPIRequest, key: str) -> FastAPIResponse:
     if env is None:
         raise RuntimeError("env not found in request.scope - R2 not available")
 
-    # API allows specifying files without .json extension
-    # Try with .json first since most files have that extension
-    if not key.endswith(".json"):
-        obj = await env.BUCKET.get(f"{key}.json")
-    else:
-        obj = None
-
-    # Try again without .json extension if not found
-    if not obj:
-        obj = await env.BUCKET.get(key)
+    obj = await env.BUCKET.get(key)
 
     if not obj:
         return FastAPIResponse(
@@ -151,7 +142,7 @@ async def get_from_r2(request: FastAPIRequest, key: str) -> FastAPIResponse:
         media_type=media_type,
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "public, max-age=3600",
+            "Cache-Control": f"public, max-age={CACHE_TTL}",
             "ETag": obj.httpEtag,
         },
     )
@@ -192,7 +183,7 @@ async def get_shields_badge(slug: str, request: FastAPIRequest):
         content=shield_schema,
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "public, max-age=3600",
+            "Cache-Control": f"public, max-age={CACHE_TTL}",
         },
     )
 
@@ -219,12 +210,12 @@ async def get_conda_index(request: FastAPIRequest):
 
 @app.get("/api/conda/{plugin_name:path}")
 async def get_conda_package(plugin_name: str, request: FastAPIRequest):
-    return await get_from_r2(request, f"conda/{plugin_name}")
+    return await get_from_r2(request, f"conda/{plugin_name}.json")
 
 
 @app.get("/api/pypi/{plugin_name:path}")
 async def get_pypi_package(plugin_name: str, request: FastAPIRequest):
-    return await get_from_r2(request, f"pypi/{plugin_name}")
+    return await get_from_r2(request, f"pypi/{plugin_name}.json")
 
 
 @app.get("/api/manifest/{plugin_name:path}")
@@ -236,7 +227,7 @@ async def get_manifest(plugin_name: str, request: FastAPIRequest):
     Uses packaging.utils.canonicalize_name which matches PyPI's normalization.
     """
     normalized = canonicalize_name(plugin_name)
-    r2_key = f"manifest/{normalized}"
+    r2_key = f"manifest/{normalized}.json"
 
     return await get_from_r2(request, r2_key)
 
@@ -254,7 +245,9 @@ async def catch_all(full_path: str, request: FastAPIRequest):
     if not full_path or full_path == "/":
         env = request.scope.get("env")
         if env is None:
-            raise RuntimeError("env not found in request.scope - R2 not available")
+            raise RuntimeError(
+                "env not found in request.scope - R2 not available"
+            )
 
         html_content = await _index_html.generate_index_html(env)
         return HTMLResponse(
